@@ -1,0 +1,144 @@
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: "Space-separated top-level test names to run (empty = full suite)"
+        required: false
+        default: ""
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        # The two Go releases supported when v0.45.0 shipped (Oct 2025), as upstream's
+        # builders test x/net. go.mod declares `go 1.24.0`.
+        go: ["1.24", "1.25"]
+    env:
+      GOTOOLCHAIN: local
+      # The http2 and internal/http3 suites are gated on `go1.25 || goexperiment.synctest`
+      # (upstream ships http2/synctest_go124_test.go for the go1.24 experiment), so
+      # enable the experiment on the 1.24 leg to compile and run them there too.
+      GOEXPERIMENT: ${{ matrix.go == '1.24' && 'synctest' || '' }}
+      TEST_FILTER: ${{ inputs.test-filter }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+          cache: false
+
+      - name: Produce module zip (golang.org/x/mod/zip.CreateFromDir)
+        if: matrix.go == '1.24'
+        run: |
+          set -euo pipefail
+          HELPER="$RUNNER_TEMP/zip-helper"
+          SRC="$RUNNER_TEMP/module-src"
+          OUT="$RUNNER_TEMP/build_output"
+          mkdir -p "$HELPER" "$SRC" "$OUT"
+          cat > "$HELPER/main.go" <<'EOF'
+          package main
+
+          import (
+                  "log"
+                  "os"
+
+                  "golang.org/x/mod/module"
+                  "golang.org/x/mod/zip"
+          )
+
+          func main() {
+                  if len(os.Args) != 5 {
+                      log.Fatal("usage: create_mod <module-path> <version> <source-dir> <output-zip>")
+                  }
+                  m := module.Version{Path: os.Args[1], Version: os.Args[2]}
+                  f, err := os.Create(os.Args[4])
+                  if err != nil {
+                      log.Fatal(err)
+                  }
+                  defer f.Close()
+                  if err := zip.CreateFromDir(f, m, os.Args[3]); err != nil {
+                      log.Fatal(err)
+                  }
+                  log.Printf("created module zip: %s", os.Args[4])
+          }
+          EOF
+          (cd "$HELPER" && go mod init example.com/ziphelper && go get golang.org/x/mod@v0.28.0)
+          # Copy the module tree without .git and without this seal workflow (.github is
+          # not part of upstream's module), then zip it with Go's own module-zip rules.
+          tar -C "$GITHUB_WORKSPACE" --exclude=./.git --exclude=./.github -cf - . | tar -C "$SRC" -xf -
+          (cd "$HELPER" && go run . golang.org/x/net v0.45.0 "$SRC" "$OUT/v0.45.0.zip")
+          unzip -l "$OUT/v0.45.0.zip" | tail -1
+
+      - uses: actions/upload-artifact@v4
+        if: matrix.go == '1.24'
+        with:
+          name: go-module-zip
+          path: ${{ runner.temp }}/build_output/v0.45.0.zip
+          if-no-files-found: error
+
+      - name: Build
+        run: |
+          go version
+          go build ./...
+        shell: bash
+
+      - name: Enable loopback IPv6 and unprivileged ICMP sockets for the network tests
+        shell: bash
+        run: |
+          set -euxo pipefail
+          # x/net's ipv6/icmp tests skip when lo has no routed IPv6 address or
+          # when unprivileged ping sockets are disallowed by ping_group_range.
+          sudo sysctl -w net.ipv6.conf.all.disable_ipv6=0 net.ipv6.conf.lo.disable_ipv6=0
+          sudo sysctl -w net.ipv4.ping_group_range="0 2147483647"
+          ip -6 addr show dev lo
+          ip addr
+
+      - name: Test
+        shell: bash
+        run: |
+          set -eo pipefail
+          if [ -n "$TEST_FILTER" ]; then
+            go test -v -run "^($(echo "$TEST_FILTER" | tr ' ' '|'))$" ./... 2>&1 | tee "$RUNNER_TEMP/scoped.log"
+            for t in $TEST_FILTER; do
+              grep -qE "^=== RUN[[:space:]]+${t}(/|$)" "$RUNNER_TEMP/scoped.log" || { echo "selected test $t did not run"; exit 1; }
+            done
+          else
+            go test -v ./... 2>&1 | tee "$RUNNER_TEMP/full.log"
+          fi
+
+      - name: Test summary
+        if: always()
+        shell: bash
+        run: |
+          LOG="$RUNNER_TEMP/full.log"
+          if [ ! -f "$LOG" ]; then LOG="$RUNNER_TEMP/scoped.log"; fi
+          if [ -f "$LOG" ]; then
+            echo "Skipped tests (with reasons):"
+            # go -v prints a test's t.Skip reason under its "=== RUN" line, while
+            # subtest results are printed later, grouped under the parent. Key the
+            # logged lines by test name and print them next to each skipped test.
+            awk '
+              /^(ok|FAIL)[[:space:]]/ {split("", r); next}
+              /^=== (RUN|CONT|NAME)/ {cur=$3; next}
+              /^[[:space:]]*--- SKIP: / {name=$3; line=$0; sub(/^[[:space:]]+/, "", line); printf "%s  reason:%s\n", line, (name in r ? r[name] : " (none logged)"); next}
+              /^[[:space:]]+[^[:space:]]+_test\.go:[0-9]+:/ {l=$0; sub(/^[[:space:]]+/, "", l); r[cur]=r[cur] " " l}
+            ' "$LOG"
+            awk '
+              /^[[:space:]]*--- PASS/ {p++}
+              /^--- PASS/ {tp++}
+              /^[[:space:]]*--- FAIL/ {f++}
+              /^[[:space:]]*--- SKIP/ {s++}
+              /^ok[[:space:]]/ {ok++}
+              /^FAIL[[:space:]]/ {pf++}
+              /no test files/ {nt++}
+              END {
+                printf "TEST SUMMARY: %d passed (incl. subtests), %d top-level passed, %d failed, %d skipped\n", p, tp, f, s
+                printf "Packages: %d ok, %d failed, %d without tests\n", ok, pf, nt
+              }' "$LOG"
+          fi
